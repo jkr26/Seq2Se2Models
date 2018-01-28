@@ -3,38 +3,61 @@
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import pandas as pd
-import os
-from Utility import load_file
-
+import psycopg2
+import string
 """
 Created on Fri Dec 29 18:38:04 2017
 
 @author: jkr
 """
 
-class WikipediaCorpus(Dataset):
-    def __init__(self, file = ""):
+
+class WikipediaCorpusFirstMillion(Dataset):
+    def __init__(self):
         """
-        Args:
-            file (string): Text file with 
         """
-        raw_data =pd.read_csv(file, delimiter="|")
-        
+        self.raw_data = read_wiki2010_corpus_first_million()
+        self.raw_data = _remove_punctuation(self.raw_data)
+
+    def __getindex__(self,idx):
+        return self.raw_data[idx]
     
+    def __len___(self):
+        return len(self.raw_data)
+    
+def _remove_punctuation(data_list):
+    table = str.maketrans("","", string.punctuation)
+    to_return = []
+    for datum in data_list:
+        summary = datum[0]
+        long_description = datum[1]
+        summary_list = []
+        description_list = []
+        for word in summary.split():
+            summary_list.append(word.translate(table))
+        for word in long_description.split():
+            description_list.append(word.translate(table))
+        to_return.append((summary_list, description_list))
+    return to_return
+
         
-        
-        
-class MyDataset(Dataset):
-    def __init__(self, file = "/home/jkr/Documents/MLData/NLPCorpora/WestburyLab.Wikipedia.Corpus.txt"):
-        self.data_files = os.listdir(file)
-        list.sort(self.data_files)
+def read_wiki2010_corpus_first_million():
+    cnxn = psycopg2.connect("host='localhost' dbname='TextSummary' user='PythonExecutor' password='2Cons!stent'")
+    cursor = cnxn.cursor()
+    try:    
+        cursor.execute("""
+                       SELECT TitleAndSummary, LongDescription
+                       FROM SummaryDescriptionPairs
+                       WHERE CorpusName = 'Wikipedia2010Corpus'
+                       """
+                       )
+        summary_description_pairs = list(set(cursor.fetchmany(10)))
+    
+    finally:
+        cursor.close()
+        cnxn.close()
+    return summary_description_pairs
 
-    def __getindex__(self, idx):
-        return load_file(self.data_files[idx])
-
-    def __len__(self):
-        return len(self.data_files)
-
-
-dset = MyDataset()
-loader = DataLoader(dset, num_workers=8)
+#if __name__=="__main__":
+#    dset = WikipediaCorpusFirstMillion()
+#    loader = DataLoader(dset, num_workers=8)
