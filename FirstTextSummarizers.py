@@ -12,6 +12,7 @@ import torch.nn.functional as F
 #from torch.utils.data import Dataset
 import PreprocessingNLPData
 import pandas as pd
+import pdb
 
 """
 Created on Mon Jan 15 10:50:25 2018
@@ -174,7 +175,7 @@ class AttnDecoderRNN(nn.Module):
         self.max_length = max_length
 
         self.embedding = nn.Embedding(self.output_size, self.hidden_size)
-        self.attn = nn.Linear(self.hidden_size * 2, self.max_length-3)
+        self.attn = nn.Linear(self.hidden_size * 2, self.max_length)
         self.attn_combine = nn.Linear(self.hidden_size * 2, self.hidden_size)
         self.dropout = nn.Dropout(self.dropout_p)
         self.lstm = nn.LSTM(self.hidden_size, self.hidden_size,
@@ -185,20 +186,26 @@ class AttnDecoderRNN(nn.Module):
         embedded = self.embedding(input).view(-1, self.hidden_size)
         embedded = self.dropout(embedded)
         hidden = [hidden[0].view(-1, self.n_layers, self.hidden_size), 
-                  hidden[1].view(-1, self.hidden_size)]
+                  hidden[1].view(-1, self.n_layers, self.hidden_size)]
         attn_weights = F.softmax(
-            self.attn(torch.cat((embedded, hidden[0]), 1)), dim=1)
+            self.attn(torch.cat((embedded, hidden[0].squeeze(1)), 1)), dim=1)
         attn_applied = torch.bmm(attn_weights.unsqueeze(1),
-                                 encoder_outputs)
+                                 encoder_outputs).squeeze(1)
 
-        output = torch.cat((embedded[0], attn_applied[0]), 1)
+        output = torch.cat((embedded, attn_applied),1)
         output = self.attn_combine(output).unsqueeze(0)
+        
+        hidden = [hidden[0].view(self.n_layers, -1, self.hidden_size), 
+                  hidden[1].view(self.n_layers, -1, self.hidden_size)]
 
         for i in range(self.n_layers):
-            output = F.relu(output)
+            output = F.relu(output).unsqueeze(1).view(-1, 1, self.hidden_size)
             output, hidden = self.lstm(output, hidden)
 
-        output = F.log_softmax(self.out(output[0]), dim=1)
+        
+#        pdb.set_trace()
+        
+        output = F.log_softmax(self.out(output), dim=-1)
         return output, hidden
     
     def initHidden(self,batch_size):
@@ -270,8 +277,8 @@ def Seq2SeqTrain(data_statistics,input_variable, target_variable, encoder,
     of sequence-to-sequence models
     """
     
-    encoder_hx = encoder.initHidden()
-    encoder_cx = encoder.initHidden()
+    encoder_hx = encoder.initHidden(1)
+    encoder_cx = encoder.initHidden(1)
     encoder_hidden = [encoder_hx, encoder_cx]
 
     encoder_optimizer.zero_grad()
@@ -320,6 +327,7 @@ def Seq2SeqTrain(data_statistics,input_variable, target_variable, encoder,
 
             decoder_input = Variable(torch.LongTensor([[ni]]))
             decoder_input = decoder_input.cuda() if use_cuda else decoder_input
+            pdb.set_trace()
             loss += criterion(decoder_output, target_variable[di])
             if ni == EOS_token:
                 break
@@ -371,7 +379,7 @@ def batchedSeq2SeqTrain(data_statistics,input_variables, target_variables, encod
             var_list.append(torch.cat([variable, to_pad]))
         else:
             var_list.append(variable)
-    input_variables = torch.cat(var_list).view(batch_size, max_input_length, -1)
+    input_variables = torch.cat(var_list).view(batch_size, ds.max_length, -1)
     ##Packing these padded variables
     #batched_input = torch.nn.utils.rnn.pack_padded_sequence(input_variables, input_lengths, batch_first=True)
     
@@ -400,7 +408,7 @@ def batchedSeq2SeqTrain(data_statistics,input_variables, target_variables, encod
     
     loss = 0
     
-    encoder_outputs = Variable(torch.zeros(batch_size, max_input_length,
+    encoder_outputs = Variable(torch.zeros(batch_size, ds.max_length,
                                            encoder.hidden_size))
     encoder_outputs = encoder_outputs.cuda() if use_cuda else encoder_outputs
 
@@ -409,7 +417,7 @@ def batchedSeq2SeqTrain(data_statistics,input_variables, target_variables, encod
     
     ##Seems that Pack_padded_sequence may be able to clean up this code...
     
-    for ei in range(max_input_length):
+    for ei in range(ds.max_length):
         encoder_output, encoder_hidden = encoder(
             input_variables[:,ei,:].unsqueeze(1), encoder_hidden)
         encoder_outputs[:, ei, :] = encoder_output[:,0,:]
@@ -417,44 +425,42 @@ def batchedSeq2SeqTrain(data_statistics,input_variables, target_variables, encod
     decoder_input = Variable(torch.LongTensor([[SOS_token]*batch_size])).view(batch_size, -1)
     decoder_input = decoder_input.cuda() if use_cuda else decoder_input
 
-    decoder_hidden = encoder_hidden
+    decoder_hidden = encoder_hidden   
     
-    """
-    OK  up to 420 basically works as I understand it on 1 27 18.
-    Need to check the DIMENSIONALITY of everything, expecially the BMM!
-    on 1 28 18
-    """
-    
-    
-    
-    teacher_forcing_ratio = 0.5
+    teacher_forcing_ratio = .5
 
     use_teacher_forcing = True if random.random() < teacher_forcing_ratio else False
 
     if use_teacher_forcing:
         # Teacher forcing: Feed the target as the next input
-        for di in range(max_target_length):
+        for di in range(max_target_length-1):
             decoder_output, decoder_hidden = decoder(
                 decoder_input, decoder_hidden, encoder_outputs)
-            loss += criterion(decoder_output, target_variable[di])
-            decoder_input = target_variable[di]  # Teacher forcing
+            
+            target_vars = target_variables.squeeze(2)[:,di+1]
+            loss += criterion(decoder_output.squeeze(1), target_vars)
+            
+            
+            decoder_input = target_vars  # Teacher forcing
 
     else:
         # Without teacher forcing: use its own predictions as the next input
-        for di in range(max_target_length):
+        for di in range(max_target_length-1):
             decoder_output, decoder_hidden = decoder(
                 decoder_input, decoder_hidden, encoder_outputs)
-            topv, topi = decoder_output.data.topk(1)
-            ni = topi[0][0]
+            preds = decoder_output.data.topk(1)
+            ni = torch.cat(preds[1])
 
-            decoder_input = Variable(torch.LongTensor([[ni]]))
+            decoder_input = Variable(ni)
+            target_vars = target_variables.squeeze(2)[:,di+1]
+            
             decoder_input = decoder_input.cuda() if use_cuda else decoder_input
-            if target_variable[di]!=0:
-                loss += criterion(decoder_output, target_variable[di])
-            if ni == EOS_token:
-                break
-
+            loss += criterion(decoder_output.squeeze(1)[(target_vars[:]>0).nonzero().squeeze()],
+                              target_vars[target_vars[:]>0])
+            
     loss.backward()
+    
+    
     
     torch.nn.utils.clip_grad_norm(encoder.parameters(), 1)
     torch.nn.utils.clip_grad_norm(decoder.parameters(), 1)
@@ -462,7 +468,7 @@ def batchedSeq2SeqTrain(data_statistics,input_variables, target_variables, encod
     encoder_optimizer.step()
     decoder_optimizer.step()
 
-    return loss.data[0] / target_length
+    return loss.data[0] 
 
 
 def evaluate(ds, encoder, decoder, input_variable, max_decoder_length=100):
@@ -581,7 +587,7 @@ def batchedTrainIters(data_statistics, pairs, encoder, decoder, n_iters, n_examp
                       plot_every=100, learning_rate=1e-3):
     """Function to train general seq2seq models with batching
     """
-    start = time.time()
+#    start = time.time()
     print_loss_total = 0  # Reset every print_every
 
     encoder_optimizer = optim.Adam(encoder.parameters(), lr=learning_rate)
@@ -592,28 +598,40 @@ def batchedTrainIters(data_statistics, pairs, encoder, decoder, n_iters, n_examp
 
     criterion = nn.NLLLoss()
 
-    for iter in range(n_iters-1):
-        training_batch = training_pairs[iter%n_examples:(iter+batch_size)%n_examples]
-        input_variables = [example[0] for example in training_batch]
-        target_variables = [example[1] for example in training_batch]
+    for iter in range(0, n_iters, batch_size):
+        if iter%n_examples<(iter+batch_size)%n_examples:
+            training_batch = training_pairs[iter%n_examples:(iter+batch_size)%n_examples]
+            
+        else:
+            list1 = training_pairs[iter%n_examples:]
+            list2 = training_pairs[:(iter+batch_size)%n_examples]
+            training_batch = list1+list2
+            
+        if training_batch:
+            input_variables = [example[0] for example in training_batch]
+            target_variables = [example[1] for example in training_batch]
+    
+            loss = batchedSeq2SeqTrain(data_statistics, input_variables, target_variables, encoder,
+                         decoder, encoder_optimizer, decoder_optimizer, criterion)
+            print_loss_total += loss
+            print(loss)
+            print(iter)
 
-        loss = batchedSeq2SeqTrain(data_statistics, input_variables, target_variables, encoder,
-                     decoder, encoder_optimizer, decoder_optimizer, criterion)
-        print_loss_total += loss
-
-        if iter % print_every == 0:
-            print_loss_avg = print_loss_total / print_every
-            print_loss_total = 0
-            print('%s (%d %d%%) %.4f' % (time.time()-start,
-                                         iter, iter / n_iters * 100, print_loss_avg))
-            print(data_statistics.targetindex2word[int(target_variables[0][1])])
-            print(evaluate(data_statistics, encoder, decoder, input_variables[0]))
+#        if iter % print_every == 0:
+#            print_loss_avg = print_loss_total / print_every
+#            print_loss_total = 0
+#            print('%s (%d %d%%) %.4f' % (time.time()-start,
+#                                         iter, iter / n_iters * 100, print_loss_avg))
+#            print(data_statistics.targetindex2word[int(target_variables[0][1])])
+#            print(evaluate(data_statistics, encoder, decoder, input_variables[0]))
                 
 if __name__ == '__main__':
     Data = PreprocessingNLPData.WikipediaCorpusFirstMillion()
     training_pairs = Data.raw_data
     ds = DataStatistics('WikipediaCorpus', max_target_vocab=20000)
     for pair in training_pairs:
+        ##0th element is the summary--1st is the long description.
+        ##A little backwards in the opinion of some
         ds.addSentence(pair[0])
         ds.updateMaxLength(pair[1])
     ds.restrictVocab()
@@ -643,8 +661,16 @@ if __name__ == '__main__':
         attn_decoder1 = attn_decoder1.cuda()
     print("Global attention")
 #    trainIters(ds, training_pairs, encoder1, attn_decoder1, 1000, len(training_pairs), print_every=10)
-#    batchedTrainIters(ds, training_pairs, encoder1, attn_decoder1, 1000, len(training_pairs), print_every=10)
-    
+    batchedTrainIters(data_statistics=ds,
+                      pairs=training_pairs,
+                      encoder=encoder1,
+                      decoder=attn_decoder1,
+                      n_iters=int(1e6),
+                      n_examples=len(training_pairs),
+                      batch_size=10,
+                      print_every=1,
+                      learning_rate = 1e-3)
+
 #    encoder2 = EncoderRNN(ds.n_words_target, hidden_size, n_layers=1)
 #    attn_decoder2 = LocalAttnDecoderRNN(hidden_size, ds.n_words_target, 
 #                                        max_length=ds.max_length,

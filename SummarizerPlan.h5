@@ -1,0 +1,11 @@
+What are the things I actually want to implement here for real?
+
+
+1. Batching for speed!!!
+2. Evaluation metrics (small-scale)
+3. Skip connections for depth
+4. Attention variants (temporal...?)
+5. Coverage
+6. Beam search (during inference, right?)
+7. Adversarial loss for generation
+8. Pointer and switch for OOV problem
