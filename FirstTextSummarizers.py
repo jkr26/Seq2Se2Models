@@ -192,7 +192,7 @@ class AttnDecoderRNN(nn.Module):
         hidden = [hidden[0].view(-1, 1, self.hidden_size), 
                   hidden[1].view(-1, 1, self.hidden_size)]
         attn_weights = F.softmax(
-            self.attn(torch.cat((embedded, hidden[0]), 1)), dim=1)
+            self.attn(torch.cat((embedded, hidden[0].squeeze(1)), 1)), dim=1)
         attn_applied = torch.bmm(attn_weights.unsqueeze(1),
                                  encoder_outputs).squeeze(1)
 
@@ -359,7 +359,7 @@ def batchedSeq2SeqTrain(data_statistics,input_variables, target_variables, encod
     decoder_input = Variable(torch.LongTensor([[SOS_token]*batch_size])).view(batch_size, -1)
     decoder_input = decoder_input.cuda() if use_cuda else decoder_input
 
-    decoder_hidden = encoder_hidden.clone()
+    decoder_hidden = encoder_hidden
     
     teacher_forcing_ratio = .5
 
@@ -403,6 +403,118 @@ def batchedSeq2SeqTrain(data_statistics,input_variables, target_variables, encod
     encoder_optimizer.step()
     decoder_optimizer.step()
 
+    return loss.data[0] 
+
+
+def batchedEval(data_statistics, input_variables, target_variables, encoder,
+                 decoder, criterion):
+    """General function for online training
+    of sequence-to-sequence models
+    """
+    
+    input_variables.sort(key = len)
+    input_variables.reverse()
+    target_variables.sort(key = len)
+    target_variables.reverse()
+    
+    batch_size = int(len(input_variables))
+    assert batch_size == int(len(target_variables))
+    
+    input_lengths = [input_variable.size()[0] for input_variable in input_variables]
+    target_lengths = [target_variable.size()[0] for target_variable in target_variables]
+
+    max_input_length = int(np.max(input_lengths))
+    max_target_length = int(np.max(target_lengths))
+
+    encoder_outputs = Variable(torch.zeros(batch_size, max_input_length,
+                                           encoder.hidden_size))
+    encoder_outputs = encoder_outputs.cuda() if use_cuda else encoder_outputs
+    
+    ##Padding input variables
+    var_list = []
+    for variable in input_variables:
+        if variable.size()[0]<ds.max_length:
+            diff = ds.max_length-variable.size()[0]
+            var_size = list(variable.size())
+            var_size[0] = int(diff)
+            to_pad = Variable(torch.zeros(*var_size))
+            to_pad = to_pad.cuda() if use_cuda else to_pad
+            var_list.append(torch.cat([variable, to_pad]))
+        else:
+            var_list.append(variable)
+    input_variables = torch.cat(var_list).view(batch_size, ds.max_length, -1)
+    ##Packing these padded variables
+    #batched_input = torch.nn.utils.rnn.pack_padded_sequence(input_variables, input_lengths, batch_first=True)
+    
+    output_var_list = []
+    for variable in target_variables:
+        if variable.size()[0]<max_target_length:
+            diff = max_target_length-variable.size()[0]
+            var_size = list(variable.size())
+            var_size[0] = int(diff)
+            to_pad = Variable(torch.LongTensor(np.zeros(var_size)))
+            to_pad = to_pad.cuda() if use_cuda else to_pad
+            output_var_list.append(torch.cat([variable, to_pad]))
+        else:
+            output_var_list.append(variable)
+    target_variables = torch.cat(output_var_list).view(batch_size, int(max_target_length), -1)
+    ##Packing these padded variables
+    #batched_target = torch.nn.utils.rnn.pack_padded_sequence(target_variables, target_lengths, batch_first=True)
+    
+    
+    encoder_hx = encoder.initHidden(batch_size)
+    encoder_cx = encoder.initHidden(batch_size)
+    encoder_hidden = [encoder_hx, encoder_cx]
+
+    loss = 0
+    
+    encoder_outputs = Variable(torch.zeros(batch_size, ds.max_length,
+                                           encoder.hidden_size))
+    encoder_outputs = encoder_outputs.cuda() if use_cuda else encoder_outputs
+
+    
+    for ei in range(ds.max_length):
+        encoder_output, encoder_hidden = encoder(
+            input_variables[:,ei,:].unsqueeze(1), encoder_hidden)
+        encoder_outputs[:, ei, :] = encoder_output[:,0,:]
+
+    decoder_input = Variable(torch.LongTensor([[SOS_token]*batch_size])).view(batch_size, -1)
+    decoder_input = decoder_input.cuda() if use_cuda else decoder_input
+
+    decoder_hidden = encoder_hidden
+    
+    teacher_forcing_ratio = .5
+
+    use_teacher_forcing = True if random.random() < teacher_forcing_ratio else False
+
+    if use_teacher_forcing:
+        # Teacher forcing: Feed the target as the next input
+        for di in range(max_target_length-1):
+            decoder_output, decoder_hidden = decoder(
+                decoder_input, decoder_hidden, encoder_outputs)
+            
+            target_vars = target_variables.squeeze(2)[:,di+1]
+            loss += criterion(decoder_output.squeeze(1), target_vars)
+            
+            
+            decoder_input = target_vars  # Teacher forcing
+
+    else:
+        # Without teacher forcing: use its own predictions as the next input
+        for di in range(max_target_length-1):
+            decoder_output, decoder_hidden = decoder(
+                decoder_input, decoder_hidden, encoder_outputs)
+            preds = decoder_output.data.topk(1)
+            ni = torch.cat(preds[1])
+
+            decoder_input = Variable(ni)
+            target_vars = target_variables.squeeze(2)[:,di+1]
+            
+            decoder_input = decoder_input.cuda() if use_cuda else decoder_input
+            if len(target_vars[target_vars[:]>0])>0:
+                loss += criterion(decoder_output.squeeze(1)[(target_vars[:]>0).nonzero().squeeze()],
+                              target_vars[target_vars[:]>0])
+            
     return loss.data[0] 
 
 
@@ -475,11 +587,7 @@ def variableFromSentence(ds, type, sentence):
         result = Variable(torch.LongTensor(np.array(indexes)).view(-1, 1))
     elif type =='input':
         result = Variable(torch.FloatTensor(np.array(indexes)).view(-1, ds.glove_vector_size))
-    if use_cuda:
-        return result.cuda()
-    else:
-        return result
-
+    return result
 
 def variablesFromPair(ds, pair):
     if pair[0] and pair[1]:
@@ -514,11 +622,14 @@ def batchedTrainIters(data_statistics, pairs, encoder, decoder, n_iters, n_examp
             training_batch = list1+list2
             
         if training_batch:
-            input_variables = [example[0] for example in training_batch]
-            target_variables = [example[1] for example in training_batch]
+            batch = [[example[0].cuda(), example[1].cuda()] for example in training_batch]
+            input_variables = [example[0] for example in batch]
+            target_variables = [example[1] for example in batch]
     
             loss = batchedSeq2SeqTrain(data_statistics, input_variables, target_variables, encoder,
                          decoder, encoder_optimizer, decoder_optimizer, criterion)
+            
+            del batch
             print_loss_total += loss
 
 
@@ -526,9 +637,18 @@ def batchedTrainIters(data_statistics, pairs, encoder, decoder, n_iters, n_examp
             print_loss_avg = print_loss_total / print_every
             print_loss_total = 0
             print('%s (%d %d%%) %.4f' % (time.time()-start,
-                                         iter, iter / n_iters * (100*batch_size), print_loss_avg))
+                                         iter, iter / (n_iters*batch_size) , print_loss_avg))
             print(data_statistics.targetindex2word[int(val_pairs[0][1][1])])
-            print(evaluate(data_statistics, encoder, decoder, val_pairs[0][0]))
+            print(evaluate(data_statistics, encoder, decoder, val_pairs[0][0].cuda()))
+            if use_cuda:
+                batch = [[example[0].cuda(), example[1].cuda()] for example in val_pairs[:10]]
+            else:
+                batch = [[example[0], example[1]] for example in val_pairs[:10]]
+            input_variables = [example[0] for example in batch]
+            target_variables = [example[1] for example in batch]
+            loss = batchedEval(data_statistics, input_variables, target_variables, encoder,
+                         decoder, criterion)
+            print("Validation loss is "+str(loss))
                 
 if __name__ == '__main__':
     Data = PreprocessingNLPData.WikipediaCorpusFirstMillion()
@@ -572,7 +692,7 @@ if __name__ == '__main__':
                       decoder=attn_decoder1,
                       n_iters=int(1e3),
                       n_examples=len(training_pairs),
-                      batch_size=10,
+                      batch_size=5,
                       print_every=100,
                       learning_rate = 1e-3)
 
