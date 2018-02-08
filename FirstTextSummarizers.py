@@ -23,7 +23,7 @@ First PyTorch text summarizers, using Wikipedia 2010 corpus
 @author: jkr
 """
 
-use_cuda = torch.cuda.is_available()
+use_cuda = False#torch.cuda.is_available()
 
 SOS_token = 0
 EOS_token = 1
@@ -102,17 +102,17 @@ class EncoderRNN(nn.Module):
         super(EncoderRNN, self).__init__()
         self.n_layers = n_layers
         self.hidden_size = hidden_size
-        self.linearinputtrans = nn.Linear(input_size, hidden_size)
+        self.inputtrans = nn.Linear(input_size, hidden_size)
         self.bi=bi
         if bi:
-            self.lstm = nn.LSTM(hidden_size, int(hidden_size/2),
+            self.lstm = nn.LSTM(input_size, int(hidden_size/2),
                                 bidirectional=bi, batch_first=True)
         else:
-            self.lstm = nn.LSTM(hidden_size, hidden_size, bidirectional=bi,
+            self.lstm = nn.LSTM(input_size, hidden_size, bidirectional=bi,
                                 batch_first=True)
 
     def forward(self, input, hidden):
-        output = self.linearinputtrans(input)
+        output = self.input_trans(input)
         for i in range(self.n_layers):
             x = output.clone()
             output, hidden = self.lstm(output,
@@ -129,6 +129,140 @@ class EncoderRNN(nn.Module):
             return result.cuda()
         else:
             return result
+        
+class LSTMMemoryController(nn.Module):
+    def __init__(self, input_size, memory_size, memory_dim, n_heads):
+        super(LSTMMemoryController, self).__init__()
+        self.memory_size = memory_size
+        self.memory_dim = memory_dim
+        self.lstm = nn.LSTM(input_size, (2*memory_dim+memory_size+4)*n_heads, batch_first=True)
+        self.hidden = None
+        self.hidden_dim = (2*memory_dim+memory_size+4)*n_heads
+        self.n_heads = n_heads
+        
+    def forward(self, input):
+        output = input.unsqueeze(1)
+        hidden = self.hidden
+        output, hidden = self.lstm(output,
+                     hidden)
+        self.hidden = hidden
+        for k in range(self.n_heads):
+            keys = self.hidden[0].squeeze(0)[:,k*(2*self.memory_dim+self.memory_size+4):k*(2*self.memory_dim+self.memory_size+4)+self.memory_size]
+            key_strength = torch.exp(self.hidden[0].squeeze(0)[:,k*(2*self.memory_dim+self.memory_size+4)+self.memory_dim:k*(2*self.memory_dim+self.memory_size+4)+self.memory_dim+1])
+            gate_strength = F.sigmoid(self.hidden[0].squeeze(0)[:,k*(2*self.memory_dim+self.memory_size+4)+self.memory_dim+1:k*(2*self.memory_dim+self.memory_size+4)+self.memory_dim+2])
+            shift = self.hidden[0].squeeze(0)[:,k*(2*self.memory_dim+self.memory_size+4)+self.memory_dim+2:k*(2*self.memory_dim+self.memory_size+4)+self.memory_size+3]
+            sharpening = 1+F.sigmoid(self.hidden[0].squeeze(0)[:,k*(2*self.memory_dim+self.memory_size+4)+self.memory_dim+3:k*(self.memory_dim+4)+self.memory_size+4])
+            erase_vector = F.sigmoid(self.hidden[0].squeeze(0)[:,k*(2*self.memory_dim+self.memory_size+4)\
+                                                                      +self.memory_dim+4:\
+                                                                      k*(2*self.memory_dim+self.memory_size+4)+self.memory_size+self.memory_dim+4])
+            add_vector = F.sigmoid(self.hidden[0].squeeze(0)[:,k*(2*self.memory_dim+self.memory_size+4)\
+                                                                    +2*self.memory_dim+4:\
+                                                                    k*(2*self.memory_dim+self.memory_size+4)+self.memory_size+2*self.memory_dim+4])
+        return keys, key_strength, gate_strength, shift, sharpening, erase_vector, add_vector
+
+    def initHidden(self, batch_size):
+        result = [Variable(torch.zeros(1, batch_size, self.hidden_dim)),
+                  Variable(torch.zeros(1, batch_size, self.hidden_dim))]
+        if use_cuda:
+            self.hidden =  [r.cuda() for r in result]
+        else:
+            self.hidden =  result
+        
+class EncoderWithMemory(nn.Module):
+    def __init__(self, input_size, hidden_dim, n_layers=1, memory_size=256, memory_dim=50, n_heads=2):
+        super(EncoderWithMemory, self).__init__()
+        self.n_layers = n_layers
+        self.hidden_dim = hidden_size
+        self.memory_size = memory_size
+        self.memory_dim = memory_dim
+        self.n_heads = n_heads
+        self.memory = None
+        self.read_heads = None
+        self.write_heads = None
+        self.input_trans = nn.Linear(input_size, hidden_dim)
+        self.read_controller = LSTMMemoryController(memory_dim*memory_size+hidden_dim, memory_size, memory_dim, int(n_heads/2))
+        self.write_controller = LSTMMemoryController(memory_dim*memory_size+hidden_dim, memory_size, memory_dim, int(n_heads/2))
+        self.lstm = nn.LSTM(hidden_dim+memory_dim*int(n_heads/2), hidden_dim, batch_first=True)
+        
+        
+    def forward(self, input, hidden):
+        output = self.input_trans(input)
+        for i in range(self.n_layers):
+            x = output.clone()
+            read_keys,\
+            read_key_strength, read_gate_strength, \
+            read_shift, read_sharpening,\
+            _, _= self.read_controller(torch.cat((hidden[0].view(-1, self.hidden_dim),
+                                                                      self.memory.view(-1, self.memory_size*self.memory_dim)), dim=1))
+            write_keys,\
+            write_key_strength, write_gate_strength, \
+            write_shift, write_sharpening,\
+            write_erase, write_add = self.write_controller(torch.cat((hidden[0].view(-1, self.hidden_dim),
+                                                                       self.memory.view(-1, self.memory_size*self.memory_dim)), dim=1))
+            read_weights = self.addressing(read_keys,\
+            read_key_strength, read_gate_strength, \
+            read_shift, read_sharpening, self.read_heads)
+            write_weights = self.addressing(write_keys,\
+            write_key_strength, write_gate_strength, \
+            write_shift, write_sharpening, self.write_heads)
+            read_in = torch.bmm(read_weights, self.memory).view(-1, 1, self.memory_dim*int(self.n_heads/2))
+            pdb.set_trace()
+            output, hidden = self.lstm(torch.cat((output, read_in), dim=2),
+                     hidden)
+            self.rewrite_memory(write_weights, write_erase, write_add)
+            output = output+x
+        
+        return output, hidden
+    
+    def rewrite_memory(self, write_weights, erase, add):
+        """Bot as bad as it once was
+        """
+        for k in range(int(self.n_heads/2)):
+            dim_corrected_weights = write_weights[:,k,:].unsqueeze(2)\
+            .expand(-1, self.memory_size, self.memory_dim)
+            
+            dim_corrected_erase_vector = erase.unsqueeze(2).expand(-1, self.memory_size, self.memory_dim)
+            self.memory = self.memory*(1-dim_corrected_weights*dim_corrected_erase_vector)
+            
+            dim_corrected_add_vector = add.unsqueeze(2).expand(-1, self.memory_size, self.memory_dim)
+            self.memory = self.memory+dim_corrected_weights*dim_corrected_add_vector
+            
+    
+    def addressing(self, keys,key_strength,gate_strength,shift, sharpening, heads):
+        """Implements addressing (I think) as in https://arxiv.org/abs/1410.5401,
+        skipping the shift and sharpening steps for now.
+        """
+        address_list = []
+        for k in range(int(self.n_heads/2)):
+            content_weighting = F.softmax(key_strength*F.cosine_similarity(keys.unsqueeze(2), self.memory, dim=2),dim=1)
+            gated = gate_strength*content_weighting + (1-gate_strength)*heads[k]
+            address_list.append(gated)
+        return torch.cat(address_list, dim=1).view(-1, int(self.n_heads/2), self.memory_size)
+
+    def initHidden(self, batch_size):
+        result = Variable(torch.zeros(1, batch_size, self.hidden_dim))
+        if use_cuda:
+            return result.cuda()
+        else:
+            return result
+        
+    def initMemory(self, batch_size):
+        mem = Variable(torch.zeros(batch_size, self.memory_size, self.memory_dim))
+        if use_cuda:
+            self.memory = mem.cuda()
+        else:
+            self.memory = mem
+        
+    def initHeads(self, batch_size):
+        read_heads = Variable(torch.zeros(batch_size, int(self.n_heads/2), self.memory_size))
+        write_heads = Variable(torch.zeros(batch_size, int(self.n_heads/2), self.memory_size))
+        if use_cuda:
+            self.read_heads = read_heads.cuda()
+            self.write_heads = write_heads.cuda()
+        else:
+            self.read_heads = read_heads
+            self.write_heads = write_heads
+
 
 class DecoderRNN(nn.Module):
     def __init__(self, hidden_size, output_size, n_layers=1, dropout_p=0):
@@ -220,8 +354,65 @@ class AttnDecoderRNN(nn.Module):
             return result.cuda()
         else:
             return result
+            
+class AttnDecoderWithMemory(nn.Module):
+    def __init__(self):
+        super(LocalAttnDecoderRNN, self).__init__()
+
         
+    def forward(self, input, hidden, encoder_outputs):
+        pass
         
+    def rewrite_memory(self, write_weights, erase, add):
+        """Christ is this bad. 
+        Problem is implementing the operations requires some strange dinemsionality casting
+        """
+        for k in range(int(self.n_heads/2)):
+            dim_corrected_weights = write_weights[:,k,:].unsqueeze(2)\
+            .expand(-1, self.memory_size, self.memory_dim)
+            
+            dim_corrected_erase_vector = erase.unsqueeze(2).expand(-1, self.memory_size, self.memory_dim)
+            self.memory = self.memory*(1-dim_corrected_weights*dim_corrected_erase_vector)
+            
+            dim_corrected_add_vector = add.unsqueeze(2).expand(-1, self.memory_size, self.memory_dim)
+            self.memory = self.memory+dim_corrected_weights*dim_corrected_add_vector
+            
+    
+    def addressing(self, keys,key_strength,gate_strength,shift, sharpening, heads):
+        """Implements addressing (I think) as in https://arxiv.org/abs/1410.5401,
+        skipping the shift and sharpening steps for now.
+        """
+        address_list = []
+        for k in range(int(self.n_heads/2)):
+            content_weighting = F.softmax(key_strength*F.cosine_similarity(keys.unsqueeze(2), self.memory, dim=2),dim=1)
+            gated = gate_strength*content_weighting + (1-gate_strength)*heads[k]
+            address_list.append(gated)
+        return torch.cat(address_list, dim=1).view(-1, int(self.n_heads/2), self.memory_size)
+
+    def initHidden(self, batch_size):
+        result = Variable(torch.zeros(1, batch_size, self.hidden_dim))
+        if use_cuda:
+            return result.cuda()
+        else:
+            return result
+        
+    def initMemory(self, batch_size):
+        mem = Variable(torch.zeros(batch_size, self.memory_size, self.memory_dim))
+        if use_cuda:
+            self.memory = mem.cuda()
+        else:
+            self.memory = mem
+        
+    def initHeads(self, batch_size):
+        read_heads = Variable(torch.zeros(batch_size, int(self.n_heads/2), self.memory_size))
+        write_heads = Variable(torch.zeros(batch_size, int(self.n_heads/2), self.memory_size))
+        if use_cuda:
+            self.read_heads = read_heads.cuda()
+            self.write_heads = write_heads.cuda()
+        else:
+            self.read_heads = read_heads
+            self.write_heads = write_heads
+
         
 class LocalAttnDecoderRNN(nn.Module):
     def __init__(self, hidden_size, output_size, max_length, 
@@ -302,7 +493,7 @@ def batchedSeq2SeqTrain(data_statistics,input_variables, target_variables, encod
     max_target_length = int(np.max(target_lengths))
 
     encoder_outputs = Variable(torch.zeros(batch_size, max_input_length,
-                                           encoder.hidden_size))
+                                           encoder.hidden_dim))
     encoder_outputs = encoder_outputs.cuda() if use_cuda else encoder_outputs
     
     ##Padding input variables
@@ -344,10 +535,18 @@ def batchedSeq2SeqTrain(data_statistics,input_variables, target_variables, encod
     encoder_optimizer.zero_grad()
     decoder_optimizer.zero_grad()
     
+    try:
+        encoder.initHeads(batch_size)
+        encoder.initMemory(batch_size)
+        encoder.read_controller.initHidden(batch_size)
+        encoder.write_controller.initHidden(batch_size)
+    except:
+        pass
+    
     loss = 0
     
     encoder_outputs = Variable(torch.zeros(batch_size, ds.max_length,
-                                           encoder.hidden_size))
+                                           encoder.hidden_dim))
     encoder_outputs = encoder_outputs.cuda() if use_cuda else encoder_outputs
 
     
@@ -355,6 +554,8 @@ def batchedSeq2SeqTrain(data_statistics,input_variables, target_variables, encod
         encoder_output, encoder_hidden = encoder(
             input_variables[:,ei,:].unsqueeze(1), encoder_hidden)
         encoder_outputs[:, ei, :] = encoder_output[:,0,:]
+
+    pdb.set_trace()
 
     decoder_input = Variable(torch.LongTensor([[SOS_token]*batch_size])).view(batch_size, -1)
     decoder_input = decoder_input.cuda() if use_cuda else decoder_input
@@ -622,7 +823,10 @@ def batchedTrainIters(data_statistics, pairs, encoder, decoder, n_iters, n_examp
             training_batch = list1+list2
             
         if training_batch:
-            batch = [[example[0].cuda(), example[1].cuda()] for example in training_batch]
+            batch = [[example[0].cuda(),
+                      example[1].cuda()] for example in training_batch] if use_cuda\
+                      else [[example[0],
+                      example[1]] for example in training_batch]
             input_variables = [example[0] for example in batch]
             target_variables = [example[1] for example in batch]
     
@@ -637,7 +841,7 @@ def batchedTrainIters(data_statistics, pairs, encoder, decoder, n_iters, n_examp
             print_loss_avg = print_loss_total / print_every
             print_loss_total = 0
             print('%s (%d %d%%) %.4f' % (time.time()-start,
-                                         iter, iter / (n_iters*batch_size) , print_loss_avg))
+                                         iter, iter / (n_iters) , print_loss_avg))
             print(data_statistics.targetindex2word[int(val_pairs[0][1][1])])
             print(evaluate(data_statistics, encoder, decoder, val_pairs[0][0].cuda()))
             if use_cuda:
@@ -648,6 +852,7 @@ def batchedTrainIters(data_statistics, pairs, encoder, decoder, n_iters, n_examp
             target_variables = [example[1] for example in batch]
             loss = batchedEval(data_statistics, input_variables, target_variables, encoder,
                          decoder, criterion)
+            del batch
             print("Validation loss is "+str(loss))
                 
 if __name__ == '__main__':
@@ -674,7 +879,7 @@ if __name__ == '__main__':
 #    trainIters(ds, training_pairs, encoder0, attn_decoder0, 10000, print_every=1)
 ###    
     
-    encoder1 = EncoderRNN(ds.glove_vector_size, hidden_size, n_layers=4)
+    encoder1 = EncoderWithMemory(ds.glove_vector_size, hidden_size, n_layers=1)
     attn_decoder1 = AttnDecoderRNN(hidden_size=hidden_size,
                                    output_size=ds.n_words_target,
                                    max_length=ds.max_length,
@@ -690,9 +895,9 @@ if __name__ == '__main__':
                       pairs=training_pairs,
                       encoder=encoder1,
                       decoder=attn_decoder1,
-                      n_iters=int(1e3),
+                      n_iters=int(1e4),
                       n_examples=len(training_pairs),
-                      batch_size=5,
+                      batch_size=10,
                       print_every=100,
                       learning_rate = 1e-3)
 

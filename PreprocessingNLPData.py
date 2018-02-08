@@ -51,7 +51,7 @@ def read_wiki2010_corpus_first_million():
                        WHERE CorpusName = 'Wikipedia2010Corpus'
                        """
                        )
-        summary_description_pairs = list(set(cursor.fetchmany(1e4)))
+        summary_description_pairs = list(set(cursor.fetchmany(1e1)))
         summary_description_pairs = [(pair[0], pair[1]) for pair in summary_description_pairs
                                      if (pair[0] and pair[1] and len(pair[1].split())<10000)]
     
@@ -60,6 +60,6 @@ def read_wiki2010_corpus_first_million():
         cnxn.close()
     return summary_description_pairs
 
-if __name__=="__main__":
-    dset = WikipediaCorpusFirstMillion()
+#if __name__=="__main__":
+#    dset = WikipediaCorpusFirstMillion()
 #    loader = DataLoader(dset, num_workers=8)
